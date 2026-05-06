@@ -1,0 +1,6 @@
+.DS_Store
+build/
+dist/
+build-arm64/
+build-intel/
+build-universal/
