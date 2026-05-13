@@ -16,8 +16,8 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "B21FE05D2FAB4B2D00FD5969"
-               BuildableName = "caffeinate.app"
-               BlueprintName = "caffeinate"
+               BuildableName = "Caffeinate.app"
+               BlueprintName = "Caffeinate"
                ReferencedContainer = "container:caffeinate.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
@@ -46,8 +46,8 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "B21FE05D2FAB4B2D00FD5969"
-            BuildableName = "caffeinate.app"
-            BlueprintName = "caffeinate"
+            BuildableName = "Caffeinate.app"
+            BlueprintName = "Caffeinate"
             ReferencedContainer = "container:caffeinate.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
@@ -63,8 +63,8 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "B21FE05D2FAB4B2D00FD5969"
-            BuildableName = "caffeinate.app"
-            BlueprintName = "caffeinate"
+            BuildableName = "Caffeinate.app"
+            BlueprintName = "Caffeinate"
             ReferencedContainer = "container:caffeinate.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>

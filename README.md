@@ -19,6 +19,10 @@ macOS menu bar app to keep the Mac awake.
 - **Launch at login**: `SMAppService.mainApp`. Toggle syncs with System Settings on launch.
 - Native Swift.
 
+## Install
+
+Release builds are available in the [Releases](https://github.com/gen-xu/caffeinate/releases) page.
+
 ## Build
 
 In Xcode: open `caffeinate.xcodeproj` and run.
