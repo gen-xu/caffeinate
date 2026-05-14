@@ -1,8 +1,11 @@
 import SwiftUI
-import Security
 import ServiceManagement
 import IOKit.pwr_mgt
 import IOKit.ps
+
+@objc protocol CaffeinateHelperProtocol {
+    func setDisableSleep(_ disable: Bool, reply: @escaping (String?) -> Void)
+}
 
 @Observable
 final class SleepManager {
@@ -60,9 +63,12 @@ final class SleepManager {
     // MARK: Internals
 
     private var assertionID: IOPMAssertionID = 0
-    private var sharedAuth: AuthorizationRef?
+    private var helperConnection: NSXPCConnection?
     private var batterySource: CFRunLoopSource?
     private var suppressDidSet = false
+
+    private static let helperLabel = "gen.caffeinate.helper"
+    private static let helperPlist = "gen.caffeinate.helper.plist"
 
     init() {
         refreshPmsetState()
@@ -106,7 +112,7 @@ final class SleepManager {
     }
 
     deinit {
-        if let auth = sharedAuth { AuthorizationFree(auth, [.destroyRights]) }
+        helperConnection?.invalidate()
         if assertionID != 0 { IOPMAssertionRelease(assertionID) }
         if let src = batterySource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), src, .defaultMode)
@@ -139,20 +145,19 @@ final class SleepManager {
     private func applySystemSleep(userInitiated: Bool, previousIntent: Bool) {
         let want = disableSystemSleep && !batterySuppressing
         guard want != pmsetDisabled else { return }
-        do {
-            try setDisableSleep(want)
-            pmsetDisabled = want
-        } catch {
-            refreshPmsetState()
-            if userInitiated {
-                // Revert toggle so UI matches reality.
-                suppressDidSet = true
-                disableSystemSleep = previousIntent
-                suppressDidSet = false
-                showError(error.localizedDescription)
-            } else {
-                // Battery-driven; surface a notification but keep intent.
-                showError("Battery is low but Caffeinate couldn't update pmset: \(error.localizedDescription)")
+        Task { @MainActor in
+            do {
+                try await callHelperSetDisableSleep(want, installIfNeeded: userInitiated)
+                pmsetDisabled = want
+            } catch {
+                refreshPmsetState()
+                if userInitiated {
+                    suppressDidSet = true
+                    disableSystemSleep = previousIntent
+                    suppressDidSet = false
+                    showError(error.localizedDescription)
+                }
+                // Background path: never pop a modal. UI surfaces divergence.
             }
         }
     }
@@ -228,79 +233,59 @@ final class SleepManager {
         applySystemSleep(userInitiated: false, previousIntent: disableSystemSleep)
     }
 
-    // MARK: Authorization
+    // MARK: Helper daemon (privileged pmset proxy)
 
     struct PmsetError: LocalizedError {
         let errorDescription: String?
         init(_ message: String) { self.errorDescription = message }
     }
 
-    private func acquireAuth() throws -> AuthorizationRef {
-        var item = AuthorizationItem(
-            name: kAuthorizationRightExecute, valueLength: 0, value: nil, flags: 0
-        )
-
-        if let existing = sharedAuth {
-            let status = withUnsafeMutablePointer(to: &item) { ptr -> OSStatus in
-                var rights = AuthorizationRights(count: 1, items: ptr)
-                return AuthorizationCopyRights(existing, &rights, nil, [.extendRights], nil)
+    private func ensureHelperInstalled(installIfNeeded: Bool) throws {
+        let service = SMAppService.daemon(plistName: Self.helperPlist)
+        switch service.status {
+        case .enabled:
+            return
+        case .requiresApproval:
+            throw PmsetError("Caffeinate Helper needs approval in System Settings → Login Items.")
+        case .notRegistered, .notFound:
+            guard installIfNeeded else {
+                throw PmsetError("Caffeinate Helper not installed. Toggle the switch to install it.")
             }
-            if status == errAuthorizationSuccess { return existing }
-            AuthorizationFree(existing, [.destroyRights])
-            sharedAuth = nil
+            try service.register()
+        @unknown default:
+            throw PmsetError("Caffeinate Helper status unknown.")
         }
-
-        var newAuth: AuthorizationRef?
-        let createStatus = AuthorizationCreate(nil, nil, [], &newAuth)
-        guard createStatus == errAuthorizationSuccess, let auth = newAuth else {
-            throw PmsetError("AuthorizationCreate failed (\(createStatus))")
-        }
-
-        let copyStatus = withUnsafeMutablePointer(to: &item) { ptr -> OSStatus in
-            var rights = AuthorizationRights(count: 1, items: ptr)
-            return AuthorizationCopyRights(
-                auth, &rights, nil,
-                [.interactionAllowed, .extendRights, .preAuthorize], nil
-            )
-        }
-        guard copyStatus == errAuthorizationSuccess else {
-            AuthorizationFree(auth, [])
-            if copyStatus == errAuthorizationCanceled {
-                throw PmsetError("Authorization canceled.")
-            }
-            throw PmsetError("AuthorizationCopyRights failed (\(copyStatus)). If this persists, make sure App Sandbox is disabled in Signing & Capabilities.")
-        }
-
-        sharedAuth = auth
-        return auth
     }
 
-    private func setDisableSleep(_ disable: Bool) throws {
-        let auth = try acquireAuth()
-
-        typealias AEWP = @convention(c) (
-            AuthorizationRef, UnsafePointer<CChar>, UInt32,
-            UnsafePointer<UnsafeMutablePointer<CChar>?>,
-            UnsafeMutableRawPointer?
-        ) -> OSStatus
-
-        let handle = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_NOW)
-            ?? dlopen(nil, RTLD_NOW)
-        guard let sym = dlsym(handle, "AuthorizationExecuteWithPrivileges") else {
-            throw PmsetError("AuthorizationExecuteWithPrivileges symbol not found.")
+    private func helperProxy() -> CaffeinateHelperProtocol? {
+        if helperConnection == nil {
+            let conn = NSXPCConnection(machServiceName: Self.helperLabel, options: .privileged)
+            conn.remoteObjectInterface = NSXPCInterface(with: CaffeinateHelperProtocol.self)
+            conn.invalidationHandler = { [weak self] in
+                Task { @MainActor in self?.helperConnection = nil }
+            }
+            conn.interruptionHandler = { [weak self] in
+                Task { @MainActor in self?.helperConnection = nil }
+            }
+            conn.resume()
+            helperConnection = conn
         }
-        let execute = unsafeBitCast(sym, to: AEWP.self)
+        return helperConnection?.remoteObjectProxyWithErrorHandler { _ in } as? CaffeinateHelperProtocol
+    }
 
-        let args: [UnsafeMutablePointer<CChar>?] = [
-            strdup("-a"), strdup("disablesleep"), strdup(disable ? "1" : "0"), nil
-        ]
-        defer { args.compactMap { $0 }.forEach { free($0) } }
-
-        let execStatus = args.withUnsafeBufferPointer { buf in
-            execute(auth, "/usr/bin/pmset", 0, buf.baseAddress!, nil)
+    private func callHelperSetDisableSleep(_ disable: Bool, installIfNeeded: Bool) async throws {
+        try ensureHelperInstalled(installIfNeeded: installIfNeeded)
+        guard let proxy = helperProxy() else {
+            throw PmsetError("Couldn't connect to Caffeinate Helper.")
         }
-        guard execStatus == errAuthorizationSuccess else {
-            throw PmsetError("pmset execution failed (\(execStatus)).")
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            proxy.setDisableSleep(disable) { errString in
+                if let errString {
+                    cont.resume(throwing: PmsetError(errString))
+                } else {
+                    cont.resume()
+                }
+            }
         }
     }
 }
@@ -322,9 +307,9 @@ struct CaffeinateView: View {
                 Toggle(isOn: $manager.disableSystemSleep) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Disable all sleep")
-                        Text("Runs pmset -a disablesleep · requires admin password.")
+                        Text(systemSleepStatus.subtitle)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(systemSleepStatus.color)
                     }
                 }
             } header: {
@@ -369,9 +354,9 @@ struct CaffeinateView: View {
 
                 if manager.batterySuppressing {
                     HStack(spacing: 8) {
-                        Image(systemName: "pause.circle.fill")
+                        Image(systemName: pmsetStuck ? "exclamationmark.triangle.fill" : "pause.circle.fill")
                             .foregroundStyle(.orange)
-                        Text("Sleep prevention paused — battery below \(manager.batteryThreshold)%.")
+                        Text(suppressBannerText)
                             .foregroundStyle(.orange)
                     }
                     .font(.callout)
@@ -430,6 +415,46 @@ struct CaffeinateView: View {
 
     private static func clamp(_ v: Int) -> Int { max(5, min(95, v)) }
 
+    private struct SystemSleepStatus { let subtitle: String; let color: Color }
+
+    private var systemSleepStatus: SystemSleepStatus {
+        let intent = manager.disableSystemSleep
+        let actual = manager.pmsetDisabled
+        let suppressing = manager.batterySuppressing
+        if intent && suppressing && actual {
+            return .init(
+                subtitle: "Battery low — couldn't release pmset (toggle off, then on, to reauthorize).",
+                color: .orange
+            )
+        }
+        if intent && suppressing && !actual {
+            return .init(
+                subtitle: "Battery low — sleep currently allowed.",
+                color: .orange
+            )
+        }
+        if intent && !suppressing && !actual {
+            return .init(
+                subtitle: "Sleep currently allowed — couldn't re-apply pmset (toggle off, then on, to reauthorize).",
+                color: .orange
+            )
+        }
+        return .init(
+            subtitle: "Runs pmset -a disablesleep · requires admin password.",
+            color: .secondary
+        )
+    }
+
+    private var pmsetStuck: Bool {
+        manager.disableSystemSleep && manager.pmsetDisabled && manager.batterySuppressing
+    }
+
+    private var suppressBannerText: String {
+        pmsetStuck
+            ? "Battery below \(manager.batteryThreshold)% — pmset still locked (reauthorize to release)."
+            : "Sleep prevention paused — battery below \(manager.batteryThreshold)%."
+    }
+
     private static var versionString: String {
         let info = Bundle.main.infoDictionary
         let short = info?["CFBundleShortVersionString"] as? String ?? "0"
@@ -474,7 +499,11 @@ struct MenuContent: View {
 
         if manager.batterySuppressing {
             Divider()
-            Text("Paused — battery at \(manager.batteryLevel)%")
+            if manager.disableSystemSleep && manager.pmsetDisabled {
+                Text("Battery low — pmset still locked, reauthorize to release")
+            } else {
+                Text("Paused — battery at \(manager.batteryLevel)%")
+            }
         }
 
         Divider()
